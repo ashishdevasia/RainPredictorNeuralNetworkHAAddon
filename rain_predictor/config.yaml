@@ -1,0 +1,23 @@
+name: "Rain Predictor (Neural Network)"
+version: "1.0.0"
+slug: "rain_predictor"
+description: "LSTM-based real-time rain prediction from temperature and humidity sensors"
+url: "https://github.com/ashishdevasia/rain-predictor"
+arch:
+  - amd64
+startup: application
+boot: auto
+hassio_api: true
+homeassistant_api: true
+options:
+  temperature_entity: "sensor.outside_t_and_h_temperature"
+  humidity_entity: "sensor.outside_t_and_h_humidity"
+  threshold: 0.89
+  debounce_seconds: 10
+  log_level: "info"
+schema:
+  temperature_entity: str
+  humidity_entity: str
+  threshold: float
+  debounce_seconds: int
+  log_level: list(info|debug|warning|error)
