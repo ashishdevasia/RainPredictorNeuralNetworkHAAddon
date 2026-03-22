@@ -94,13 +94,24 @@ class RainPredictor:
         if threshold is None:
             threshold = self.threshold
 
+        # Log all datapoints the model will see
+        log.debug("Model input (%d slots):", WINDOW_SIZE)
+        for slot_i in range(WINDOW_SIZE):
+            log.debug("  slot %2d: temp=%.1f, humid=%.1f", slot_i, window[slot_i, 0], window[slot_i, 1])
+
         # Normalize
         normalized = (window - self.mean) / self.scale
         input_tensor = normalized.reshape(1, WINDOW_SIZE, 2).astype(np.float32)
 
+        log.debug("Normalized ranges: temp=[%.2f..%.2f], humid=[%.2f..%.2f]",
+                  normalized[:, 0].min(), normalized[:, 0].max(),
+                  normalized[:, 1].min(), normalized[:, 1].max())
+
         # Run ONNX
         logit = self.session.run(None, {"input": input_tensor})[0].item()
         probability = 1.0 / (1.0 + np.exp(-logit))  # sigmoid
+
+        log.debug("Inference result: logit=%.4f, probability=%.4f", logit, probability)
 
         return {
             "is_raining": bool(probability >= threshold),
@@ -116,9 +127,9 @@ class SensorBuffer:
     """
     Maintains timestamped sensor readings and builds the 32-slot window.
 
-    On each prediction request, computes 32 target timestamps going back
-    from the current time at 15-minute intervals, and finds the closest
-    reading for each slot.
+    Uses "last value before target" semantics: since the Zigbee sensor
+    publishes on significant change, the last reading before a timestamp
+    represents the valid value at that time.
     """
 
     def __init__(self):
@@ -131,55 +142,81 @@ class SensorBuffer:
         # Keep only last 24 hours to avoid unbounded growth
         cutoff = time.time() - 24 * 3600
         self.readings = [(t, temp, hum) for t, temp, hum in self.readings if t > cutoff]
+        log.debug("Buffer: added reading t=%.1f/h=%.1f at %s, total=%d",
+                  temperature, humidity,
+                  datetime.fromtimestamp(timestamp).strftime("%H:%M:%S"),
+                  len(self.readings))
+
+    def _find_last_before(self, target_ts: float) -> tuple[float, float] | None:
+        """
+        Find the last reading at or before the target timestamp.
+
+        Since the sensor publishes on change, the last value before a
+        timestamp is the most accurate value at that time — it was valid
+        from when it was published until the next change.
+        """
+        best = None
+        for ts, temp, hum in self.readings:
+            if ts <= target_ts:
+                best = (temp, hum)
+            else:
+                break  # readings are sorted, no point checking further
+        return best
 
     def build_window(self, now: float | None = None) -> np.ndarray | None:
         """
         Build a (WINDOW_SIZE, 2) array for the model.
 
         Computes target timestamps: now, now-15m, now-30m, ..., now-7h45m
-        For each target, finds the closest reading within ±10 minutes.
+        For each target, uses the last reading at or before that time.
         Returns None if we don't have enough data.
         """
         if not self.readings:
+            log.debug("build_window: no readings in buffer")
             return None
 
         if now is None:
             now = time.time()
 
-        # Target timestamps: current, -15m, -30m, ..., -(WINDOW_SIZE-1)*15m
-        targets = [now - i * INTERVAL_SECONDS for i in range(WINDOW_SIZE)]
-        targets.reverse()  # oldest first
+        # Sort readings by timestamp (should already be sorted, but be safe)
+        self.readings.sort(key=lambda x: x[0])
+
+        # Target timestamps: oldest first
+        targets = [now - (WINDOW_SIZE - 1 - i) * INTERVAL_SECONDS for i in range(WINDOW_SIZE)]
 
         window = np.zeros((WINDOW_SIZE, 2), dtype=np.float32)
-        max_gap = INTERVAL_SECONDS * 0.75  # ±11.25 minutes tolerance
+        filled = 0
 
         for i, target in enumerate(targets):
-            # Find closest reading to this target
-            best = None
-            best_dist = float("inf")
-            for ts, temp, hum in self.readings:
-                dist = abs(ts - target)
-                if dist < best_dist:
-                    best_dist = dist
-                    best = (temp, hum)
+            reading = self._find_last_before(target)
 
-            if best is None or best_dist > max_gap:
-                # For the most recent slot, allow wider tolerance (use latest reading)
-                if i == WINDOW_SIZE - 1 and self.readings:
-                    latest = self.readings[-1]
-                    window[i] = [latest[1], latest[2]]
-                else:
-                    log.debug("Gap at slot %d (target=%s, best_dist=%.0fs)",
-                              i, datetime.fromtimestamp(target).strftime("%H:%M"), best_dist)
-                    # Use nearest available or interpolate from neighbors
-                    if best is not None:
-                        window[i] = [best[0], best[1]]
-                    elif i > 0:
-                        window[i] = window[i - 1]  # carry forward
-                    else:
-                        return None  # can't fill first slot
+            if reading is not None:
+                window[i] = [reading[0], reading[1]]
+                filled += 1
+                log.debug("Slot %2d (%s): temp=%.1f, humid=%.1f (last before)",
+                          i, datetime.fromtimestamp(target).strftime("%H:%M"), 
+                          reading[0], reading[1])
+            elif i > 0:
+                # Carry forward from previous slot
+                window[i] = window[i - 1]
+                filled += 1
+                log.debug("Slot %2d (%s): temp=%.1f, humid=%.1f (carried forward)",
+                          i, datetime.fromtimestamp(target).strftime("%H:%M"),
+                          window[i][0], window[i][1])
             else:
-                window[i] = [best[0], best[1]]
+                log.debug("Slot %2d (%s): no data available", 
+                          i, datetime.fromtimestamp(target).strftime("%H:%M"))
+
+        if filled < WINDOW_SIZE:
+            log.debug("build_window: only filled %d/%d slots", filled, WINDOW_SIZE)
+            # Still return the window — carry-forward fills gaps
+            if filled == 0:
+                return None
+
+        log.debug("build_window: filled %d/%d slots, temp=[%.1f..%.1f], humid=[%.1f..%.1f]",
+                  filled, WINDOW_SIZE,
+                  window[:, 0].min(), window[:, 0].max(),
+                  window[:, 1].min(), window[:, 1].max())
 
         return window
 
@@ -206,6 +243,7 @@ async def get_sensor_state(session: aiohttp.ClientSession, entity_id: str) -> fl
             if resp.status == 200:
                 data = await resp.json()
                 state = data.get("state")
+                log.debug("Current state of %s: %s", entity_id, state)
                 if state and state not in ("unknown", "unavailable"):
                     return float(state)
     except Exception as e:
@@ -214,7 +252,7 @@ async def get_sensor_state(session: aiohttp.ClientSession, entity_id: str) -> fl
 
 
 async def get_sensor_history(
-    session: aiohttp.ClientSession, entity_id: str, hours: int = 9
+    session: aiohttp.ClientSession, entity_id: str, hours: int = 12
 ) -> list[tuple[float, float]]:
     """
     Get historical readings for a sensor from HA's recorder.
@@ -229,6 +267,8 @@ async def get_sensor_history(
         f"{SUPERVISOR_URL}/core/api/history/period/{start_str}"
         f"?filter_entity_id={entity_id}&minimal_response&no_attributes"
     )
+
+    log.debug("Fetching history for %s from %s", entity_id, start_str)
 
     try:
         async with session.get(url, headers=api_headers()) as resp:
@@ -251,7 +291,14 @@ async def get_sensor_history(
                                 readings.append((ts, val))
                             except (ValueError, TypeError):
                                 continue
-                    return sorted(readings, key=lambda x: x[0])
+                    readings = sorted(readings, key=lambda x: x[0])
+                    log.debug("History for %s: %d readings, range %s → %s",
+                              entity_id, len(readings),
+                              datetime.fromtimestamp(readings[0][0]).strftime("%H:%M") if readings else "?",
+                              datetime.fromtimestamp(readings[-1][0]).strftime("%H:%M") if readings else "?")
+                    return readings
+            else:
+                log.warning("History API returned %d for %s", resp.status, entity_id)
     except Exception as e:
         log.warning("Failed to get history for %s: %s", entity_id, e)
     return []
@@ -265,7 +312,9 @@ async def set_entity_state(
     payload = {"state": state, "attributes": attributes}
     try:
         async with session.post(url, headers=api_headers(), json=payload) as resp:
-            if resp.status not in (200, 201):
+            if resp.status in (200, 201):
+                log.debug("Set %s = %s", entity_id, state)
+            else:
                 text = await resp.text()
                 log.warning("Failed to set %s: %d %s", entity_id, resp.status, text)
     except Exception as e:
@@ -294,21 +343,28 @@ async def backfill_buffer(
         log.warning("No history available — predictions will start once enough data accumulates")
         return
 
-    # Merge temperature and humidity by finding closest timestamps
+    # Merge: for each temperature reading, find the last humidity reading at or before it
     for t_ts, t_val in temp_history:
-        # Find closest humidity reading
+        # Find last humidity reading at or before this temperature timestamp
         best_h = None
-        best_dist = float("inf")
         for h_ts, h_val in humid_history:
-            dist = abs(h_ts - t_ts)
-            if dist < best_dist:
-                best_dist = dist
+            if h_ts <= t_ts:
                 best_h = h_val
+            else:
+                break
 
-        if best_h is not None and best_dist < 300:  # within 5 minutes
+        if best_h is not None:
             buffer.add_reading(t_ts, t_val, best_h)
+            log.debug("Backfill: %s temp=%.1f humid=%.1f",
+                      datetime.fromtimestamp(t_ts).strftime("%H:%M:%S"),
+                      t_val, best_h)
 
     log.info("  Buffer populated with %d readings", buffer.count)
+
+    if buffer.count > 0:
+        oldest = datetime.fromtimestamp(buffer.readings[0][0]).strftime("%H:%M:%S")
+        newest = datetime.fromtimestamp(buffer.readings[-1][0]).strftime("%H:%M:%S")
+        log.info("  Buffer time range: %s → %s", oldest, newest)
 
 
 async def run_prediction(
@@ -318,6 +374,8 @@ async def run_prediction(
     threshold: float,
 ):
     """Run inference and update HA entities."""
+    log.debug("Running prediction (buffer has %d readings)...", buffer.count)
+
     window = buffer.build_window()
     if window is None:
         log.debug("Not enough data for prediction yet")
@@ -326,10 +384,11 @@ async def run_prediction(
     result = predictor.predict(window, threshold)
 
     log.info(
-        "Prediction: probability=%.4f, is_raining=%s (threshold=%.2f)",
+        "Prediction: probability=%.4f, is_raining=%s (threshold=%.2f, buffer=%d readings)",
         result["probability"],
         result["is_raining"],
         result["threshold"],
+        buffer.count,
     )
 
     # Update binary sensor
@@ -391,7 +450,7 @@ async def websocket_listener(
             async with http_session.ws_connect(ws_url) as ws:
                 # Step 1: Receive auth_required
                 msg = await ws.receive_json()
-                log.debug("WS: %s", msg.get("type"))
+                log.debug("WS recv: %s", msg)
 
                 # Step 2: Authenticate
                 await ws.send_json({
@@ -412,7 +471,7 @@ async def websocket_listener(
                     "event_type": "state_changed",
                 })
                 msg = await ws.receive_json()
-                log.debug("Subscribed: %s", msg)
+                log.debug("Subscribe response: %s", msg)
 
                 # Step 4: Listen for events
                 async for msg in ws:
@@ -431,18 +490,22 @@ async def websocket_listener(
                         new_state = event_data.get("new_state", {})
                         state_val = new_state.get("state")
                         if state_val in (None, "unknown", "unavailable"):
+                            log.debug("Ignoring %s: state=%s", entity_id, state_val)
                             continue
 
                         try:
                             val = float(state_val)
                         except (ValueError, TypeError):
+                            log.debug("Ignoring %s: non-numeric state=%s", entity_id, state_val)
                             continue
 
                         # Update latest values
                         if entity_id == temp_entity:
                             latest_temp = val
+                            log.debug("Sensor update: %s = %.1f", entity_id, val)
                         elif entity_id == humid_entity:
                             latest_humid = val
+                            log.debug("Sensor update: %s = %.1f", entity_id, val)
 
                         # Add reading if we have both
                         if latest_temp is not None and latest_humid is not None:
@@ -455,6 +518,9 @@ async def websocket_listener(
                                     http_session, predictor, buffer, threshold
                                 )
                                 last_prediction_time = now
+                            else:
+                                log.debug("Debounced (%.1fs since last prediction)",
+                                          now - last_prediction_time)
 
                     elif msg.type in (
                         aiohttp.WSMsgType.CLOSED,
@@ -464,7 +530,7 @@ async def websocket_listener(
                         break
 
         except Exception as e:
-            log.error("WebSocket error: %s", e)
+            log.error("WebSocket error: %s", e, exc_info=True)
 
         log.info("Reconnecting in 5 seconds...")
         await asyncio.sleep(5)
@@ -483,12 +549,14 @@ async def main():
     )
 
     log.info("=" * 50)
-    log.info("Rain Predictor Addon starting")
+    log.info("Rain Predictor Addon v1.0.1 starting")
     log.info("=" * 50)
     log.info("Temperature entity: %s", config["temperature_entity"])
     log.info("Humidity entity: %s", config["humidity_entity"])
     log.info("Threshold: %.2f", config["threshold"])
     log.info("Debounce: %ds", config["debounce_seconds"])
+    log.info("Window size: %d slots (%d hours)", WINDOW_SIZE, WINDOW_SIZE * 15 // 60)
+    log.info("Log level: %s", config.get("log_level", "info"))
 
     # Load model
     predictor = RainPredictor()
