@@ -1,5 +1,5 @@
 name: "Rain Predictor (Neural Network)"
-version: "1.0.1"
+version: "1.0.2"
 slug: "rain_predictor"
 description: "LSTM-based real-time rain prediction from temperature and humidity sensors"
 url: "https://github.com/ashishdevasia/rain-predictor"

@@ -383,6 +383,10 @@ async def run_prediction(
 
     result = predictor.predict(window, threshold)
 
+    # Slot 31 = most recent datapoint fed to the model
+    current_temp = float(window[WINDOW_SIZE - 1, 0])
+    current_humid = float(window[WINDOW_SIZE - 1, 1])
+
     log.info(
         "Prediction: probability=%.4f, is_raining=%s (threshold=%.2f, buffer=%d readings)",
         result["probability"],
@@ -418,6 +422,8 @@ async def run_prediction(
             "threshold": result["threshold"],
             "is_raining": result["is_raining"],
             "buffer_size": buffer.count,
+            "current_temperature": current_temp,
+            "current_humidity": current_humid,
         },
     )
 
@@ -441,9 +447,15 @@ async def websocket_listener(
     ws_url = f"{SUPERVISOR_URL}/core/websocket"
     last_prediction_time = 0.0
 
-    # Track latest known values
-    latest_temp = None
-    latest_humid = None
+    # Track latest known values — seed from buffer so we don't wait for both sensors
+    if buffer.readings:
+        last_reading = buffer.readings[-1]
+        latest_temp = last_reading[1]
+        latest_humid = last_reading[2]
+        log.debug("Seeded latest values from buffer: temp=%.1f, humid=%.1f", latest_temp, latest_humid)
+    else:
+        latest_temp = None
+        latest_humid = None
 
     while True:
         try:
@@ -549,7 +561,7 @@ async def main():
     )
 
     log.info("=" * 50)
-    log.info("Rain Predictor Addon v1.0.1 starting")
+    log.info("Rain Predictor Addon v1.0.2 starting")
     log.info("=" * 50)
     log.info("Temperature entity: %s", config["temperature_entity"])
     log.info("Humidity entity: %s", config["humidity_entity"])
